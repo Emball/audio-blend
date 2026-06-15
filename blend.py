@@ -325,7 +325,7 @@ def _spectral_envelope_correction(apollo_band: np.ndarray,
 
         kernel = np.ones(ENVELOPE_SMOOTH) / ENVELOPE_SMOOTH
         ratio  = np.clip(np.convolve(env_b / env_a, kernel, mode='same'),
-                         1.0 / limit, limit)
+                         1.0, limit)  # upward-only: never pull Apollo down
 
         out_frames = np.empty_like(frames_a)
         for fi, frame in enumerate(frames_a):
@@ -391,12 +391,13 @@ def process_chunk(apollo_ms: np.ndarray, algo_ms: np.ndarray,
     # LOW/MID: simple broadband RMS match (no taper issue in these bands)
     b1_a = b1_a * _rms_scale(b1_a, b1_b)
     b2_a = b2_a * _rms_scale(b2_a, b2_b)
-    # AIR/ULTRA/SILK: spectral envelope correction — fixes Apollo's confidence
-    # fade where the network tapers amplitude approaching its reconstruction ceiling
+    # AIR: spectral envelope correction — boosts Apollo where it tapers toward
+    # its reconstruction ceiling. Correction is upward-only (never pulls Apollo
+    # down to match ST's brickwall roll-off).
     b3_a = _spectral_envelope_correction(b3_a, b3_b)
-    b4_a = _spectral_envelope_correction(b4_a, b4_b)
-    b5_a = _spectral_envelope_correction(b5_a, b5_b)
-    # ULTRASONIC: 100% Apollo, no correction needed
+    # ULTRA/SILK/ULTRASONIC: Apollo is trusted for amplitude here — ST's envelope
+    # is falling toward its own brickwall (16.5kHz), so correcting Apollo toward
+    # ST would chase a null. No level correction applied; blend weights only.
 
     out = (b1_a * w1 + b1_b * (1.0 - w1) +
            b2_a * w2 + b2_b * (1.0 - w2) +
