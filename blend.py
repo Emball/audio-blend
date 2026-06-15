@@ -36,7 +36,8 @@ from scipy.fft import next_fast_len
 #   MID   XOVER_PHASE_KNEE – XOVER_MID_TOP : Apollo artifact cleanup
 #   AIR   XOVER_MID_TOP – XOVER_APOLLO_WALL : Apollo +8dB (Delta of Spectra)
 #   ULTRA XOVER_APOLLO_WALL – XOVER_ST_WALL : both synthesizing, even blend
-#   SILK  XOVER_ST_WALL – Nyq : ST conservative preferred
+#   SILK       XOVER_ST_WALL – XOVER_ULTRASONIC : ST conservative preferred
+#   ULTRASONIC XOVER_ULTRASONIC – Nyq : above hearing, Apollo reconstruction only
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 44100
 CHANNELS    = 2
@@ -46,13 +47,15 @@ XOVER_PHASE_KNEE  = 10700   # Hz
 XOVER_MID_TOP     = 13000   # Hz
 XOVER_APOLLO_WALL = 15500   # Hz
 XOVER_ST_WALL     = 16500   # Hz
+XOVER_ULTRASONIC  = 20000   # Hz — above human hearing, Apollo preferred
 
 # Per-band Apollo weights (ST weight = 1 - w)
-W_LOW   = 0.35
-W_MID   = 0.60
-W_AIR   = 0.65
-W_ULTRA = 0.50
-W_SILK  = 0.40
+W_LOW        = 0.35
+W_MID        = 0.60
+W_AIR        = 0.65
+W_ULTRA      = 0.50
+W_SILK       = 0.40
+W_ULTRASONIC = 1.00  # above 20kHz: Apollo's reconstruction is all we want
 
 TRANSIENT_THRESHOLD  = 0.35
 TRANSIENT_ALGO_BOOST = 0.15  # extra ST weight during transients
@@ -228,12 +231,14 @@ def align_sources(apollo: np.ndarray, algo: np.ndarray, fs: int
 # lp2 = LP @ XOVER_MID_TOP
 # lp3 = LP @ XOVER_APOLLO_WALL
 # lp4 = LP @ XOVER_ST_WALL
+# lp5 = LP @ XOVER_ULTRASONIC
 #
-# band1 (LOW)   = lp1(x)
-# band2 (MID)   = lp2(x) - lp1(x)
-# band3 (AIR)   = lp3(x) - lp2(x)
-# band4 (ULTRA) = lp4(x) - lp3(x)
-# band5 (SILK)  = x_delayed - lp4(x)     ← needs matching delay on raw signal
+# band1 (LOW)        = lp1(x)
+# band2 (MID)        = lp2(x) - lp1(x)
+# band3 (AIR)        = lp3(x) - lp2(x)
+# band4 (ULTRA)      = lp4(x) - lp3(x)
+# band5 (SILK)       = lp5(x) - lp4(x)
+# band6 (ULTRASONIC) = x_delayed - lp5(x)
 #
 # All lp filters use FIR_TAPS taps → group delay = (FIR_TAPS-1)/2 samples.
 # The raw signal (band5 complement) is delayed by the same amount via StreamingDelay.
@@ -265,8 +270,10 @@ class BlendState:
         self.lp2_b = StreamingFIR(_design_lp(XOVER_MID_TOP,     SAMPLE_RATE))
         self.lp3_a = StreamingFIR(_design_lp(XOVER_APOLLO_WALL, SAMPLE_RATE))
         self.lp3_b = StreamingFIR(_design_lp(XOVER_APOLLO_WALL, SAMPLE_RATE))
-        self.lp4_a = StreamingFIR(_design_lp(XOVER_ST_WALL,     SAMPLE_RATE))
-        self.lp4_b = StreamingFIR(_design_lp(XOVER_ST_WALL,     SAMPLE_RATE))
+        self.lp4_a = StreamingFIR(_design_lp(XOVER_ST_WALL,      SAMPLE_RATE))
+        self.lp4_b = StreamingFIR(_design_lp(XOVER_ST_WALL,      SAMPLE_RATE))
+        self.lp5_a = StreamingFIR(_design_lp(XOVER_ULTRASONIC,   SAMPLE_RATE))
+        self.lp5_b = StreamingFIR(_design_lp(XOVER_ULTRASONIC,   SAMPLE_RATE))
 
         # Delay raw signal to match FIR group delay for band5 complement
         self.delay_a = StreamingDelay(GROUP_DELAY)
@@ -290,36 +297,42 @@ def process_chunk(apollo_ms: np.ndarray, algo_ms: np.ndarray,
     lp3_b = st.lp3_b.process(algo_ms)
     lp4_a = st.lp4_a.process(apollo_ms)
     lp4_b = st.lp4_b.process(algo_ms)
+    lp5_a = st.lp5_a.process(apollo_ms)
+    lp5_b = st.lp5_b.process(algo_ms)
 
-    # Delay raw signal to match group delay for SILK complement
+    # Delay raw signal to match group delay for ULTRASONIC complement
     raw_a = st.delay_a.process(apollo_ms)
     raw_b = st.delay_b.process(algo_ms)
 
     # Extract bands via subtraction — uniform group delay across all bands
-    b1_a = lp1_a                   # LOW   apollo
-    b1_b = lp1_b                   # LOW   algo
-    b2_a = lp2_a - lp1_a           # MID   apollo
-    b2_b = lp2_b - lp1_b           # MID   algo
-    b3_a = lp3_a - lp2_a           # AIR   apollo
-    b3_b = lp3_b - lp2_b           # AIR   algo
-    b4_a = lp4_a - lp3_a           # ULTRA apollo
-    b4_b = lp4_b - lp3_b           # ULTRA algo
-    b5_a = raw_a - lp4_a           # SILK  apollo
-    b5_b = raw_b - lp4_b           # SILK  algo
+    b1_a = lp1_a                   # LOW        apollo
+    b1_b = lp1_b                   # LOW        algo
+    b2_a = lp2_a - lp1_a           # MID        apollo
+    b2_b = lp2_b - lp1_b           # MID        algo
+    b3_a = lp3_a - lp2_a           # AIR        apollo
+    b3_b = lp3_b - lp2_b           # AIR        algo
+    b4_a = lp4_a - lp3_a           # ULTRA      apollo
+    b4_b = lp4_b - lp3_b           # ULTRA      algo
+    b5_a = lp5_a - lp4_a           # SILK       apollo
+    b5_b = lp5_b - lp4_b           # SILK       algo
+    b6_a = raw_a - lp5_a           # ULTRASONIC apollo
+    b6_b = raw_b - lp5_b           # ULTRASONIC algo
 
     # Per-band weights
     t_str = transient_strength(apollo_ms)
-    w1 = np.float32(W_LOW   - t_str * TRANSIENT_ALGO_BOOST)
+    w1 = np.float32(W_LOW        - t_str * TRANSIENT_ALGO_BOOST)
     w2 = np.float32(W_MID)
     w3 = np.float32(W_AIR)
     w4 = np.float32(W_ULTRA)
     w5 = np.float32(W_SILK)
+    w6 = np.float32(W_ULTRASONIC)
 
-    out = (b1_a * w1           + b1_b * (1.0 - w1) +
-           b2_a * w2           + b2_b * (1.0 - w2) +
-           b3_a * w3           + b3_b * (1.0 - w3) +
-           b4_a * w4           + b4_b * (1.0 - w4) +
-           b5_a * w5           + b5_b * (1.0 - w5))
+    out = (b1_a * w1 + b1_b * (1.0 - w1) +
+           b2_a * w2 + b2_b * (1.0 - w2) +
+           b3_a * w3 + b3_b * (1.0 - w3) +
+           b4_a * w4 + b4_b * (1.0 - w4) +
+           b5_a * w5 + b5_b * (1.0 - w5) +
+           b6_a * w6 + b6_b * (1.0 - w6))
     return out.astype(np.float32)
 
 
@@ -398,7 +411,7 @@ def main() -> int:
           f"{XOVER_PHASE_KNEE} / {XOVER_MID_TOP} / {XOVER_APOLLO_WALL} / {XOVER_ST_WALL} Hz",
           file=sys.stderr)
     print(f"[blend] band weights (Apollo): "
-          f"LOW={W_LOW} MID={W_MID} AIR={W_AIR} ULTRA={W_ULTRA} SILK={W_SILK}",
+          f"LOW={W_LOW} MID={W_MID} AIR={W_AIR} ULTRA={W_ULTRA} SILK={W_SILK} ULTRASONIC={W_ULTRASONIC}",
           file=sys.stderr)
 
     apollo_path = Path(args.apollo)
