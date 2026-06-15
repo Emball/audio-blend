@@ -283,20 +283,61 @@ class BlendState:
 
 
 # ---------------------------------------------------------------------------
-# Per-band RMS level matching
+# Spectral envelope correction for Apollo's high-frequency confidence fade
 #
-# Before blending, scale Apollo's band to match ST's RMS in that band.
-# This ensures blend weights control character/texture, not level.
-# A smoothing floor (RMS_FLOOR) prevents division by near-zero in silent bands.
-# The scale is clamped to MAX_SCALE to avoid explosive gain on bands where
-# ST has energy but Apollo is nearly silent (e.g. above 20kHz).
+# Apollo's network loses confidence as frequencies approach the top of its
+# reconstruction range, causing amplitudes to taper — a gradual fade within
+# the band, not a constant offset. A single RMS scalar can't fix this.
+#
+# For AIR/ULTRA/SILK bands we compute the average spectral envelope of both
+# signals, derive a smoothed frequency-dependent gain curve that corrects
+# Apollo's taper to match ST's level profile, and apply it via STFT multiply.
+# LOW/MID use a simple broadband RMS scalar (no taper problem there).
+#
+# ENVELOPE_FFTSIZE : frequency resolution for envelope estimation
+# ENVELOPE_SMOOTH  : FFT bins to smooth the correction curve (~350Hz at 44100/4096)
+# MAX_CORRECTION_DB: clamp — never boost Apollo more than this at any frequency
 # ---------------------------------------------------------------------------
-RMS_FLOOR = 1e-6
-MAX_SCALE = 4.0   # never let Apollo band be boosted more than 12dB to match ST
+RMS_FLOOR          = 1e-6
+MAX_SCALE          = 4.0
+ENVELOPE_FFTSIZE   = 4096
+ENVELOPE_SMOOTH    = 32
+MAX_CORRECTION_DB  = 9.0
+
+
+def _spectral_envelope_correction(apollo_band: np.ndarray,
+                                   algo_band: np.ndarray) -> np.ndarray:
+    """Correct Apollo's spectral envelope to match ST's within this band."""
+    N     = ENVELOPE_FFTSIZE
+    limit = 10 ** (MAX_CORRECTION_DB / 20.0)
+    out   = np.empty_like(apollo_band)
+
+    for c in range(apollo_band.shape[1]):
+        a = apollo_band[:, c].astype(np.float64)
+        b = algo_band[:,   c].astype(np.float64)
+
+        pad = (-len(a)) % N
+        frames_a = np.pad(a, (0, pad)).reshape(-1, N)
+        frames_b = np.pad(b, (0, pad)).reshape(-1, N)
+
+        env_a = np.mean(np.abs(np.fft.rfft(frames_a, axis=1)) + RMS_FLOOR, axis=0)
+        env_b = np.mean(np.abs(np.fft.rfft(frames_b, axis=1)) + RMS_FLOOR, axis=0)
+
+        kernel = np.ones(ENVELOPE_SMOOTH) / ENVELOPE_SMOOTH
+        ratio  = np.clip(np.convolve(env_b / env_a, kernel, mode='same'),
+                         1.0 / limit, limit)
+
+        out_frames = np.empty_like(frames_a)
+        for fi, frame in enumerate(frames_a):
+            out_frames[fi, :] = np.fft.irfft(np.fft.rfft(frame) * ratio)[:N]
+
+        out[:, c] = out_frames.flatten()[:len(a)].astype(np.float32)
+
+    return out.astype(np.float32)
 
 
 def _rms_scale(apollo_band: np.ndarray, algo_band: np.ndarray) -> np.float32:
-    """Return scalar to multiply apollo_band so its RMS matches algo_band."""
+    """Broadband RMS scalar — used only for LOW/MID bands."""
     rms_a = np.sqrt(np.mean(apollo_band ** 2) + RMS_FLOOR ** 2)
     rms_b = np.sqrt(np.mean(algo_band  ** 2) + RMS_FLOOR ** 2)
     return np.float32(np.clip(rms_b / rms_a, 1.0 / MAX_SCALE, MAX_SCALE))
@@ -347,13 +388,15 @@ def process_chunk(apollo_ms: np.ndarray, algo_ms: np.ndarray,
     w5 = np.float32(W_SILK)
     w6 = np.float32(W_ULTRASONIC)
 
-    # Level-match Apollo to ST per band so weights control character not level.
-    # ULTRASONIC band skipped — Apollo is 100% there, no blend to level-match.
+    # LOW/MID: simple broadband RMS match (no taper issue in these bands)
     b1_a = b1_a * _rms_scale(b1_a, b1_b)
     b2_a = b2_a * _rms_scale(b2_a, b2_b)
-    b3_a = b3_a * _rms_scale(b3_a, b3_b)
-    b4_a = b4_a * _rms_scale(b4_a, b4_b)
-    b5_a = b5_a * _rms_scale(b5_a, b5_b)
+    # AIR/ULTRA/SILK: spectral envelope correction — fixes Apollo's confidence
+    # fade where the network tapers amplitude approaching its reconstruction ceiling
+    b3_a = _spectral_envelope_correction(b3_a, b3_b)
+    b4_a = _spectral_envelope_correction(b4_a, b4_b)
+    b5_a = _spectral_envelope_correction(b5_a, b5_b)
+    # ULTRASONIC: 100% Apollo, no correction needed
 
     out = (b1_a * w1 + b1_b * (1.0 - w1) +
            b2_a * w2 + b2_b * (1.0 - w2) +
