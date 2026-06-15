@@ -2,6 +2,9 @@
 """
 blend.py — Perceptual blending of Apollo neural + algorithmic audio restorations.
 
+5-band crossover via LP subtraction — all bands share identical group delay,
+eliminating the discontinuities caused by cascaded FIR bandpass paths.
+
 Crossover architecture calibrated from DeltaWave analysis (MP3 vs Apollo,
 MP3 vs ST, Apollo vs ST) on 192kbps MP3 material, June 2026.
 
@@ -14,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -23,45 +27,37 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import firwin, fftconvolve
 from scipy.fft import next_fast_len
-from scipy.signal import stft as scipy_stft, istft as scipy_istft
 
 # ---------------------------------------------------------------------------
 # Constants — calibrated from DeltaWave measurements (2026-06-14)
 #
 # Band structure (MP3-centric):
-#   LOW   0 – XOVER_PHASE_KNEE : Apollo and ST nearly identical spectrally.
-#                                  ST wins: 1.81° phase error vs Apollo's 15.86°
-#                                  → blend 35/65 Apollo/ST (artifact cleanup / phase)
-#   MID   XOVER_PHASE_KNEE – XOVER_MID_TOP : gradual divergence begins.
-#                                  Apollo has more controlled energy.
-#                                  → blend 60/40 Apollo/ST
-#   AIR   XOVER_MID_TOP – XOVER_APOLLO_WALL : Apollo +8dB vs ST, synthesis starting.
-#                                  Apollo wins on energy, temper with ST for continuity.
-#                                  → blend 65/35 Apollo/ST
-#   ULTRA XOVER_APOLLO_WALL – XOVER_ST_WALL : Apollo brickwall synthesis at +18dB.
-#                                  Both are synthesizing. Apollo brighter, ST conservative.
-#                                  → blend 50/50
-#   SILK  XOVER_ST_WALL – Nyq   : Both in extreme synthesis territory. Conservative blend.
-#                                  → blend 40/60 Apollo/ST
+#   LOW   0 – XOVER_PHASE_KNEE : ST wins — 1.81° phase vs Apollo's 15.86°
+#   MID   XOVER_PHASE_KNEE – XOVER_MID_TOP : Apollo artifact cleanup
+#   AIR   XOVER_MID_TOP – XOVER_APOLLO_WALL : Apollo +8dB (Delta of Spectra)
+#   ULTRA XOVER_APOLLO_WALL – XOVER_ST_WALL : both synthesizing, even blend
+#   SILK  XOVER_ST_WALL – Nyq : ST conservative preferred
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 44100
 CHANNELS    = 2
 CHUNK_SIZE  = 262144  # ~5.9s at 44100
 
-XOVER_PHASE_KNEE  = 10700   # Hz: where Apollo/ST phase starts diverging (15.86° avg)
-XOVER_MID_TOP     = 13000   # Hz: Delta of Spectra rising above 2dB; red on spectrogram
-XOVER_APOLLO_WALL = 15500   # Hz: Apollo's synthesis brickwall (15.8kHz from MP3 vs Apollo)
-XOVER_ST_WALL     = 16500   # Hz: ST's roll-off point (16.5kHz from MP3 vs ST)
+XOVER_PHASE_KNEE  = 10700   # Hz
+XOVER_MID_TOP     = 13000   # Hz
+XOVER_APOLLO_WALL = 15500   # Hz
+XOVER_ST_WALL     = 16500   # Hz
 
-# Per-band Apollo weights (ST weight = 1 - apollo_w)
-W_LOW   = 0.35   # ST phase advantage dominates
-W_MID   = 0.60   # Apollo artifact cleanup
-W_AIR   = 0.65   # Apollo energy advantage
-W_ULTRA = 0.50   # both synthesizing, blend evenly
-W_SILK  = 0.40   # ST more conservative above its own wall
+# Per-band Apollo weights (ST weight = 1 - w)
+W_LOW   = 0.35
+W_MID   = 0.60
+W_AIR   = 0.65
+W_ULTRA = 0.50
+W_SILK  = 0.40
 
-TRANSIENT_THRESHOLD  = 0.35   # peak/RMS ratio above which transient weighting activates
-TRANSIENT_ALGO_BOOST = 0.15   # extra ST weight during transients (phase coherence)
+TRANSIENT_THRESHOLD  = 0.35
+TRANSIENT_ALGO_BOOST = 0.15  # extra ST weight during transients
+
+FIR_TAPS = 2049  # must be odd; group delay = (FIR_TAPS - 1) / 2 = 1024 samples
 
 FORMAT_DEFAULTS = {
     "wav":  {"ext": "wav",  "codec": None},
@@ -71,18 +67,12 @@ FORMAT_DEFAULTS = {
 
 
 # ---------------------------------------------------------------------------
-# FIR design — linear-phase, odd-tap, Hamming window
+# FIR design — linear-phase, fixed tap count so all filters share same group delay
 # ---------------------------------------------------------------------------
-def _design_fir(pass_type: str, freq: float, fs: int, base_taps: int = 513) -> np.ndarray:
-    nyq = fs / 2.0
+def _design_lp(freq: float, fs: int) -> np.ndarray:
+    nyq  = fs / 2.0
     norm = np.clip(freq / nyq, 0.001, 0.999)
-    numtaps = (base_taps * 4) | 1  # force odd
-    if pass_type == "lp":
-        h = firwin(numtaps, norm, window="hamming", pass_zero=True)
-    elif pass_type == "hp":
-        h = firwin(numtaps, norm, window="hamming", pass_zero=False)
-    else:
-        raise ValueError(f"Unknown pass_type: {pass_type}")
+    h = firwin(FIR_TAPS, norm, window="hamming", pass_zero=True)
     return h.astype(np.float32)
 
 
@@ -91,11 +81,11 @@ def _design_fir(pass_type: str, freq: float, fs: int, base_taps: int = 513) -> n
 # ---------------------------------------------------------------------------
 class StreamingFIR:
     def __init__(self, taps: np.ndarray):
-        self.h = taps.astype(np.float32)
-        self.L = len(taps)
-        self._H    = None
+        self.h      = taps.astype(np.float32)
+        self.L      = len(taps)
+        self._H     = None
         self._fft_n = 0
-        self._tail = None
+        self._tail  = None
 
     def process(self, chunk: np.ndarray) -> np.ndarray:
         M, C = chunk.shape
@@ -109,24 +99,9 @@ class StreamingFIR:
             Y = np.fft.rfft(block, self._fft_n) * self._H
             y = np.fft.irfft(Y, self._fft_n)
             out[:, c] = y[self.L - 1: self.L - 1 + M]
-        tail_len = self.L - 1
+        tail_len   = self.L - 1
         self._tail = (chunk[-tail_len:] if M >= tail_len
                       else np.concatenate([self._tail[M:], chunk])).copy()
-        return out
-
-
-class StreamingDelay:
-    def __init__(self, D: int):
-        self.D    = D
-        self._buf = None
-
-    def process(self, chunk: np.ndarray) -> np.ndarray:
-        M, C = chunk.shape
-        if self._buf is None:
-            self._buf = np.zeros((self.D, C), dtype=np.float32)
-        combined = np.concatenate([self._buf, chunk])
-        out       = combined[:M].copy()
-        self._buf = combined[M: M + self.D].copy()
         return out
 
 
@@ -160,10 +135,10 @@ def align_sources(apollo: np.ndarray, algo: np.ndarray, fs: int
     MAX_OFFSET = fs // 4
     mono_a = apollo[:, 0].astype(np.float64)
     mono_b = algo[:, 0].astype(np.float64)
-    n = min(len(mono_a), len(mono_b), fs * 10)
-    ref  = mono_b[:n] - mono_b[:n].mean()
-    test = mono_a[:n] - mono_a[:n].mean()
-    corr = fftconvolve(ref, test[::-1], mode='full')
+    n      = min(len(mono_a), len(mono_b), fs * 10)
+    ref    = mono_b[:n] - mono_b[:n].mean()
+    test   = mono_a[:n] - mono_a[:n].mean()
+    corr   = fftconvolve(ref, test[::-1], mode='full')
     mid    = len(test) - 1
     search = corr[mid - MAX_OFFSET: mid + MAX_OFFSET + 1]
     offset = MAX_OFFSET - int(np.argmax(np.abs(search)))
@@ -178,42 +153,60 @@ def align_sources(apollo: np.ndarray, algo: np.ndarray, fs: int
 
 
 # ---------------------------------------------------------------------------
-# Pipeline state — 5-band crossover network
+# Pipeline state
+#
+# Band extraction via LP subtraction — every band passes through exactly ONE
+# FIR filter, so group delay is identical across all bands. No cascading.
+#
+# lp1 = LP @ XOVER_PHASE_KNEE
+# lp2 = LP @ XOVER_MID_TOP
+# lp3 = LP @ XOVER_APOLLO_WALL
+# lp4 = LP @ XOVER_ST_WALL
+#
+# band1 (LOW)   = lp1(x)
+# band2 (MID)   = lp2(x) - lp1(x)
+# band3 (AIR)   = lp3(x) - lp2(x)
+# band4 (ULTRA) = lp4(x) - lp3(x)
+# band5 (SILK)  = x_delayed - lp4(x)     ← needs matching delay on raw signal
+#
+# All lp filters use FIR_TAPS taps → group delay = (FIR_TAPS-1)/2 samples.
+# The raw signal (band5 complement) is delayed by the same amount via StreamingDelay.
 # ---------------------------------------------------------------------------
+GROUP_DELAY = (FIR_TAPS - 1) // 2  # samples
+
+
+class StreamingDelay:
+    def __init__(self, D: int):
+        self.D    = D
+        self._buf = None
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        M, C = chunk.shape
+        if self._buf is None:
+            self._buf = np.zeros((self.D, C), dtype=np.float32)
+        combined  = np.concatenate([self._buf, chunk])
+        out        = combined[:M].copy()
+        self._buf  = combined[M: M + self.D].copy()
+        return out
+
+
 class BlendState:
     def __init__(self):
-        # FIR group delay: (numtaps - 1) / 2 = (513*4 | 1 - 1) / 2 = 1024 samples
-        self._D = ((513 * 4) | 1 - 1) // 2
+        # Four LP filters — one per crossover point, same tap count = same group delay
+        self.lp1_a = StreamingFIR(_design_lp(XOVER_PHASE_KNEE,  SAMPLE_RATE))
+        self.lp1_b = StreamingFIR(_design_lp(XOVER_PHASE_KNEE,  SAMPLE_RATE))
+        self.lp2_a = StreamingFIR(_design_lp(XOVER_MID_TOP,     SAMPLE_RATE))
+        self.lp2_b = StreamingFIR(_design_lp(XOVER_MID_TOP,     SAMPLE_RATE))
+        self.lp3_a = StreamingFIR(_design_lp(XOVER_APOLLO_WALL, SAMPLE_RATE))
+        self.lp3_b = StreamingFIR(_design_lp(XOVER_APOLLO_WALL, SAMPLE_RATE))
+        self.lp4_a = StreamingFIR(_design_lp(XOVER_ST_WALL,     SAMPLE_RATE))
+        self.lp4_b = StreamingFIR(_design_lp(XOVER_ST_WALL,     SAMPLE_RATE))
 
-        # Band 1: low-pass below XOVER_PHASE_KNEE
-        self.lp1_a = StreamingFIR(_design_fir("lp", XOVER_PHASE_KNEE, SAMPLE_RATE))
-        self.lp1_b = StreamingFIR(_design_fir("lp", XOVER_PHASE_KNEE, SAMPLE_RATE))
+        # Delay raw signal to match FIR group delay for band5 complement
+        self.delay_a = StreamingDelay(GROUP_DELAY)
+        self.delay_b = StreamingDelay(GROUP_DELAY)
 
-        # Band 2: band-pass XOVER_PHASE_KNEE – XOVER_MID_TOP
-        self.bp2_hp_a = StreamingFIR(_design_fir("hp", XOVER_PHASE_KNEE, SAMPLE_RATE))
-        self.bp2_hp_b = StreamingFIR(_design_fir("hp", XOVER_PHASE_KNEE, SAMPLE_RATE))
-        self.bp2_lp_a = StreamingFIR(_design_fir("lp", XOVER_MID_TOP,   SAMPLE_RATE))
-        self.bp2_lp_b = StreamingFIR(_design_fir("lp", XOVER_MID_TOP,   SAMPLE_RATE))
-
-        # Band 3: band-pass XOVER_MID_TOP – XOVER_APOLLO_WALL
-        self.bp3_hp_a = StreamingFIR(_design_fir("hp", XOVER_MID_TOP,     SAMPLE_RATE))
-        self.bp3_hp_b = StreamingFIR(_design_fir("hp", XOVER_MID_TOP,     SAMPLE_RATE))
-        self.bp3_lp_a = StreamingFIR(_design_fir("lp", XOVER_APOLLO_WALL, SAMPLE_RATE))
-        self.bp3_lp_b = StreamingFIR(_design_fir("lp", XOVER_APOLLO_WALL, SAMPLE_RATE))
-
-        # Band 4: band-pass XOVER_APOLLO_WALL – XOVER_ST_WALL
-        self.bp4_hp_a = StreamingFIR(_design_fir("hp", XOVER_APOLLO_WALL, SAMPLE_RATE))
-        self.bp4_hp_b = StreamingFIR(_design_fir("hp", XOVER_APOLLO_WALL, SAMPLE_RATE))
-        self.bp4_lp_a = StreamingFIR(_design_fir("lp", XOVER_ST_WALL,    SAMPLE_RATE))
-        self.bp4_lp_b = StreamingFIR(_design_fir("lp", XOVER_ST_WALL,    SAMPLE_RATE))
-
-        # Band 5: high-pass above XOVER_ST_WALL
-        self.hp5_a = StreamingFIR(_design_fir("hp", XOVER_ST_WALL, SAMPLE_RATE))
-        self.hp5_b = StreamingFIR(_design_fir("hp", XOVER_ST_WALL, SAMPLE_RATE))
-
-        # Delay passthrough (time-align un-filtered path — not used in blend but
-        # kept so group delay on all bands is equal at reconstruction)
-        self.total_delay = self._D * 2  # two cascaded filters in band-pass paths
+        self.total_delay = GROUP_DELAY
 
 
 # ---------------------------------------------------------------------------
@@ -222,35 +215,46 @@ class BlendState:
 def process_chunk(apollo_ms: np.ndarray, algo_ms: np.ndarray,
                   st: BlendState) -> np.ndarray:
 
-    # Band 1: LOW (0 – XOVER_PHASE_KNEE) — ST phase advantage
-    b1_a = st.lp1_a.process(apollo_ms)
-    b1_b = st.lp1_b.process(algo_ms)
+    # Compute all LP outputs — each signal goes through exactly one filter
+    lp1_a = st.lp1_a.process(apollo_ms)
+    lp1_b = st.lp1_b.process(algo_ms)
+    lp2_a = st.lp2_a.process(apollo_ms)
+    lp2_b = st.lp2_b.process(algo_ms)
+    lp3_a = st.lp3_a.process(apollo_ms)
+    lp3_b = st.lp3_b.process(algo_ms)
+    lp4_a = st.lp4_a.process(apollo_ms)
+    lp4_b = st.lp4_b.process(algo_ms)
+
+    # Delay raw signal to match group delay for SILK complement
+    raw_a = st.delay_a.process(apollo_ms)
+    raw_b = st.delay_b.process(algo_ms)
+
+    # Extract bands via subtraction — uniform group delay across all bands
+    b1_a = lp1_a                   # LOW   apollo
+    b1_b = lp1_b                   # LOW   algo
+    b2_a = lp2_a - lp1_a           # MID   apollo
+    b2_b = lp2_b - lp1_b           # MID   algo
+    b3_a = lp3_a - lp2_a           # AIR   apollo
+    b3_b = lp3_b - lp2_b           # AIR   algo
+    b4_a = lp4_a - lp3_a           # ULTRA apollo
+    b4_b = lp4_b - lp3_b           # ULTRA algo
+    b5_a = raw_a - lp4_a           # SILK  apollo
+    b5_b = raw_b - lp4_b           # SILK  algo
+
+    # Per-band weights
     t_str = transient_strength(apollo_ms)
-    # During transients, lean further toward ST for phase coherence
-    w_a1 = np.float32(W_LOW  - t_str * TRANSIENT_ALGO_BOOST)
-    b1   = b1_a * w_a1 + b1_b * np.float32(1.0 - w_a1)
+    w1 = np.float32(W_LOW   - t_str * TRANSIENT_ALGO_BOOST)
+    w2 = np.float32(W_MID)
+    w3 = np.float32(W_AIR)
+    w4 = np.float32(W_ULTRA)
+    w5 = np.float32(W_SILK)
 
-    # Band 2: MID (XOVER_PHASE_KNEE – XOVER_MID_TOP) — Apollo artifact cleanup
-    b2_a = st.bp2_lp_a.process(st.bp2_hp_a.process(apollo_ms))
-    b2_b = st.bp2_lp_b.process(st.bp2_hp_b.process(algo_ms))
-    b2   = b2_a * np.float32(W_MID) + b2_b * np.float32(1.0 - W_MID)
-
-    # Band 3: AIR (XOVER_MID_TOP – XOVER_APOLLO_WALL) — Apollo energy (+8dB)
-    b3_a = st.bp3_lp_a.process(st.bp3_hp_a.process(apollo_ms))
-    b3_b = st.bp3_lp_b.process(st.bp3_hp_b.process(algo_ms))
-    b3   = b3_a * np.float32(W_AIR) + b3_b * np.float32(1.0 - W_AIR)
-
-    # Band 4: ULTRA (XOVER_APOLLO_WALL – XOVER_ST_WALL) — even blend
-    b4_a = st.bp4_lp_a.process(st.bp4_hp_a.process(apollo_ms))
-    b4_b = st.bp4_lp_b.process(st.bp4_hp_b.process(algo_ms))
-    b4   = b4_a * np.float32(W_ULTRA) + b4_b * np.float32(1.0 - W_ULTRA)
-
-    # Band 5: SILK (XOVER_ST_WALL – Nyq) — ST more conservative above its wall
-    b5_a = st.hp5_a.process(apollo_ms)
-    b5_b = st.hp5_b.process(algo_ms)
-    b5   = b5_a * np.float32(W_SILK) + b5_b * np.float32(1.0 - W_SILK)
-
-    return b1 + b2 + b3 + b4 + b5
+    out = (b1_a * w1           + b1_b * (1.0 - w1) +
+           b2_a * w2           + b2_b * (1.0 - w2) +
+           b3_a * w3           + b3_b * (1.0 - w3) +
+           b4_a * w4           + b4_b * (1.0 - w4) +
+           b5_a * w5           + b5_b * (1.0 - w5))
+    return out.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +268,6 @@ def load_audio(path: Path, target_sr: int) -> np.ndarray:
         data = data[:, :2]
     if sr != target_sr:
         print(f"[load] {path.name}: resampling {sr} → {target_sr}", file=sys.stderr)
-        import os
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             tmp_path = tmp.name
         sf.write(tmp_path, data, sr, subtype='FLOAT')
@@ -283,7 +286,6 @@ def write_output(data: np.ndarray, output_path: Path, format_name: str,
     if format_name == 'wav':
         sf.write(str(output_path), data, SAMPLE_RATE, subtype='FLOAT')
         return
-    import os
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
         tmp_path = tmp.name
     sf.write(tmp_path, data, SAMPLE_RATE, subtype='FLOAT')
@@ -305,38 +307,35 @@ def write_output(data: np.ndarray, output_path: Path, format_name: str,
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(description="Blend Apollo + algorithmic restorations (MP3-tuned)")
-    parser.add_argument('--apollo',    required=True, help='Apollo-restored WAV')
-    parser.add_argument('--algo',      required=True, help='Algorithmic restoration WAV (Stereo Tool etc.)')
-    parser.add_argument('--output',    required=True, help='Output file path')
-    parser.add_argument('--format',    default='wav', choices=list(FORMAT_DEFAULTS))
-    parser.add_argument('--bitrate',   default=None,  help='Bitrate for lossy output')
-    parser.add_argument('--bit-depth', default=None,  type=int, help='Bit depth for FLAC')
-    parser.add_argument('--chunk-size',default=CHUNK_SIZE, type=int)
-    parser.add_argument('--crossover', default=None, type=float,
-                        help='Override the primary crossover point (XOVER_MID_TOP, default 13000)')
+    parser.add_argument('--apollo',     required=True,  help='Apollo-restored WAV')
+    parser.add_argument('--algo',       required=True,  help='Algorithmic restoration WAV')
+    parser.add_argument('--output',     required=True,  help='Output file path')
+    parser.add_argument('--format',     default='wav',  choices=list(FORMAT_DEFAULTS))
+    parser.add_argument('--bitrate',    default=None,   help='Bitrate for lossy output')
+    parser.add_argument('--bit-depth',  default=None,   type=int, help='Bit depth for FLAC')
+    parser.add_argument('--chunk-size', default=CHUNK_SIZE, type=int)
+    parser.add_argument('--crossover',  default=None,   type=float,
+                        help='Shift primary crossover point (XOVER_MID_TOP default 13000Hz)')
     args = parser.parse_args()
+
+    if args.crossover is not None:
+        global XOVER_MID_TOP, XOVER_APOLLO_WALL, XOVER_ST_WALL, XOVER_PHASE_KNEE
+        shift             = args.crossover - XOVER_MID_TOP
+        XOVER_PHASE_KNEE  = max(1000, XOVER_PHASE_KNEE  + shift)
+        XOVER_MID_TOP     = args.crossover
+        XOVER_APOLLO_WALL = max(XOVER_MID_TOP + 500,   XOVER_APOLLO_WALL + shift)
+        XOVER_ST_WALL     = max(XOVER_APOLLO_WALL + 500, XOVER_ST_WALL   + shift)
+
+    print(f"[blend] 5-band crossovers: "
+          f"{XOVER_PHASE_KNEE} / {XOVER_MID_TOP} / {XOVER_APOLLO_WALL} / {XOVER_ST_WALL} Hz",
+          file=sys.stderr)
+    print(f"[blend] band weights (Apollo): "
+          f"LOW={W_LOW} MID={W_MID} AIR={W_AIR} ULTRA={W_ULTRA} SILK={W_SILK}",
+          file=sys.stderr)
 
     apollo_path = Path(args.apollo)
     algo_path   = Path(args.algo)
     output_path = Path(args.output)
-
-    if args.crossover is not None:
-        global XOVER_MID_TOP, XOVER_APOLLO_WALL, XOVER_ST_WALL, XOVER_PHASE_KNEE
-        shift = args.crossover - XOVER_MID_TOP
-        XOVER_MID_TOP     = args.crossover
-        XOVER_APOLLO_WALL = max(XOVER_MID_TOP + 500,  XOVER_APOLLO_WALL + shift)
-        XOVER_ST_WALL     = max(XOVER_APOLLO_WALL + 500, XOVER_ST_WALL  + shift)
-        XOVER_PHASE_KNEE  = max(1000, XOVER_PHASE_KNEE + shift)
-        print(f"[blend] crossover override → "
-              f"{XOVER_PHASE_KNEE:.0f} / {XOVER_MID_TOP:.0f} / "
-              f"{XOVER_APOLLO_WALL:.0f} / {XOVER_ST_WALL:.0f} Hz", file=sys.stderr)
-    else:
-        print(f"[blend] 5-band crossovers: "
-              f"{XOVER_PHASE_KNEE} / {XOVER_MID_TOP} / "
-              f"{XOVER_APOLLO_WALL} / {XOVER_ST_WALL} Hz", file=sys.stderr)
-        print(f"[blend] band weights (Apollo): "
-              f"LOW={W_LOW} MID={W_MID} AIR={W_AIR} ULTRA={W_ULTRA} SILK={W_SILK}",
-              file=sys.stderr)
 
     print(f"[blend] loading {apollo_path.name}...", file=sys.stderr)
     apollo = load_audio(apollo_path, SAMPLE_RATE)
@@ -348,8 +347,9 @@ def main() -> int:
     total_samples = len(apollo)
     print(f"[blend] {total_samples / SAMPLE_RATE:.1f}s to process", file=sys.stderr)
 
-    st = BlendState()
-    output_chunks = []
+    st         = BlendState()
+    chunks_out = []
+    skip       = st.total_delay
     chunk_size = args.chunk_size
 
     for i in range(0, total_samples, chunk_size):
@@ -358,27 +358,32 @@ def main() -> int:
         n = min(len(a_chunk), len(b_chunk))
         a_chunk, b_chunk = a_chunk[:n], b_chunk[:n]
 
-        # Pad to 1024 boundary
-        rem = n % 1024
-        if rem:
-            pad = 1024 - rem
-            a_chunk = np.pad(a_chunk, ((0, pad), (0, 0)))
-            b_chunk = np.pad(b_chunk, ((0, pad), (0, 0)))
-
-        a_ms = ms_encode(a_chunk)
-        b_ms = ms_encode(b_chunk)
+        a_ms   = ms_encode(a_chunk)
+        b_ms   = ms_encode(b_chunk)
         out_ms = process_chunk(a_ms, b_ms, st)
-        out = ms_decode(out_ms)
+        out    = ms_decode(out_ms)
 
-        output_chunks.append(out[:n])
+        if skip > 0:
+            if out.shape[0] <= skip:
+                skip -= out.shape[0]
+                continue
+            out  = out[skip:]
+            skip = 0
 
+        chunks_out.append(out)
         pct = min(100, i * 100 // total_samples)
         print(f"\r  {pct:3d}% — {i / SAMPLE_RATE:.1f}s / {total_samples / SAMPLE_RATE:.1f}s",
               end='', file=sys.stderr)
 
+    # Flush group delay
+    flush_in  = np.zeros((GROUP_DELAY, CHANNELS), dtype=np.float32)
+    flush_ms  = process_chunk(ms_encode(flush_in), ms_encode(flush_in), st)
+    flush_out = ms_decode(flush_ms)
+    chunks_out.append(flush_out[:GROUP_DELAY])
+
     print(f"\r  done — {total_samples / SAMPLE_RATE:.1f}s processed" + " " * 20, file=sys.stderr)
 
-    result = np.concatenate(output_chunks, axis=0)
+    result = np.concatenate(chunks_out, axis=0)[:total_samples]
     result = np.clip(result, -1.0, 1.0)
 
     print(f"[blend] writing {output_path}...", file=sys.stderr)
