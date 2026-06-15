@@ -283,6 +283,26 @@ class BlendState:
 
 
 # ---------------------------------------------------------------------------
+# Per-band RMS level matching
+#
+# Before blending, scale Apollo's band to match ST's RMS in that band.
+# This ensures blend weights control character/texture, not level.
+# A smoothing floor (RMS_FLOOR) prevents division by near-zero in silent bands.
+# The scale is clamped to MAX_SCALE to avoid explosive gain on bands where
+# ST has energy but Apollo is nearly silent (e.g. above 20kHz).
+# ---------------------------------------------------------------------------
+RMS_FLOOR = 1e-6
+MAX_SCALE = 4.0   # never let Apollo band be boosted more than 12dB to match ST
+
+
+def _rms_scale(apollo_band: np.ndarray, algo_band: np.ndarray) -> np.float32:
+    """Return scalar to multiply apollo_band so its RMS matches algo_band."""
+    rms_a = np.sqrt(np.mean(apollo_band ** 2) + RMS_FLOOR ** 2)
+    rms_b = np.sqrt(np.mean(algo_band  ** 2) + RMS_FLOOR ** 2)
+    return np.float32(np.clip(rms_b / rms_a, 1.0 / MAX_SCALE, MAX_SCALE))
+
+
+# ---------------------------------------------------------------------------
 # Process one chunk (M/S domain)
 # ---------------------------------------------------------------------------
 def process_chunk(apollo_ms: np.ndarray, algo_ms: np.ndarray,
@@ -326,6 +346,14 @@ def process_chunk(apollo_ms: np.ndarray, algo_ms: np.ndarray,
     w4 = np.float32(W_ULTRA)
     w5 = np.float32(W_SILK)
     w6 = np.float32(W_ULTRASONIC)
+
+    # Level-match Apollo to ST per band so weights control character not level.
+    # ULTRASONIC band skipped — Apollo is 100% there, no blend to level-match.
+    b1_a = b1_a * _rms_scale(b1_a, b1_b)
+    b2_a = b2_a * _rms_scale(b2_a, b2_b)
+    b3_a = b3_a * _rms_scale(b3_a, b3_b)
+    b4_a = b4_a * _rms_scale(b4_a, b4_b)
+    b5_a = b5_a * _rms_scale(b5_a, b5_b)
 
     out = (b1_a * w1 + b1_b * (1.0 - w1) +
            b2_a * w2 + b2_b * (1.0 - w2) +
