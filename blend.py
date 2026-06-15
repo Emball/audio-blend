@@ -65,6 +65,72 @@ FORMAT_DEFAULTS = {
     "mp3":  {"ext": "mp3",  "codec": "libmp3lame", "default_bitrate": "320k"},
 }
 
+# ---------------------------------------------------------------------------
+# Post-blend EQ — two biquad stages applied to the final output
+#
+# Stage 1: Bell at the reconstruction boundary (~14kHz, +1.5dB, Q=0.7)
+#   Smooth lift across the zone where Apollo's synthesis meets surviving content.
+# Stage 2: High shelf above ~16kHz, +1.8dB
+#   Compensates for the net air loss from blending ST (which rolls off at 16.5kHz)
+#   against Apollo in the silk band.
+# ---------------------------------------------------------------------------
+EQ_BELL_FREQ  = 14000.0   # Hz — reconstruction boundary centre
+EQ_BELL_GAIN  =   1.5     # dB
+EQ_BELL_Q     =   0.7     # broad bell
+
+EQ_SHELF_FREQ = 16000.0   # Hz — high shelf corner
+EQ_SHELF_GAIN =   1.8     # dB
+
+
+def _biquad_bell(fc: float, gain_db: float, Q: float, fs: int
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """Peaking EQ biquad coefficients (b, a)."""
+    A  = 10 ** (gain_db / 40.0)
+    w0 = 2 * np.pi * fc / fs
+    alpha = np.sin(w0) / (2 * Q)
+    b0 =  1 + alpha * A
+    b1 = -2 * np.cos(w0)
+    b2 =  1 - alpha * A
+    a0 =  1 + alpha / A
+    a1 = -2 * np.cos(w0)
+    a2 =  1 - alpha / A
+    return (np.array([b0/a0, b1/a0, b2/a0], dtype=np.float64),
+            np.array([1.0,   a1/a0, a2/a0], dtype=np.float64))
+
+
+def _biquad_high_shelf(fc: float, gain_db: float, fs: int
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """High shelf biquad coefficients (b, a)."""
+    A  = 10 ** (gain_db / 40.0)
+    w0 = 2 * np.pi * fc / fs
+    cos_w0 = np.cos(w0)
+    sin_w0 = np.sin(w0)
+    alpha  = sin_w0 / 2 * np.sqrt((A + 1/A) * (1/1.0 - 1) + 2)  # S=1
+    b0 =      A * ((A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha)
+    b1 = -2 * A * ((A-1) + (A+1)*cos_w0)
+    b2 =      A * ((A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
+    a0 =           (A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
+    a1 =  2 *     ((A-1) - (A+1)*cos_w0)
+    a2 =           (A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha
+    return (np.array([b0/a0, b1/a0, b2/a0], dtype=np.float64),
+            np.array([1.0,   a1/a0, a2/a0], dtype=np.float64))
+
+
+def _apply_biquad(data: np.ndarray, b: np.ndarray, a: np.ndarray) -> np.ndarray:
+    """Apply biquad filter sample-by-sample (stable, works on any length)."""
+    from scipy.signal import sosfilt, tf2sos
+    sos = tf2sos(b, a)
+    return sosfilt(sos, data.astype(np.float64), axis=0).astype(np.float32)
+
+
+def apply_post_eq(data: np.ndarray, fs: int) -> np.ndarray:
+    """Apply bell + high shelf to blended output."""
+    b1, a1 = _biquad_bell(EQ_BELL_FREQ,  EQ_BELL_GAIN,  EQ_BELL_Q, fs)
+    b2, a2 = _biquad_high_shelf(EQ_SHELF_FREQ, EQ_SHELF_GAIN, fs)
+    out = _apply_biquad(data, b1, a1)
+    out = _apply_biquad(out,  b2, a2)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # FIR design — linear-phase, fixed tap count so all filters share same group delay
@@ -316,6 +382,8 @@ def main() -> int:
     parser.add_argument('--chunk-size', default=CHUNK_SIZE, type=int)
     parser.add_argument('--crossover',  default=None,   type=float,
                         help='Shift primary crossover point (XOVER_MID_TOP default 13000Hz)')
+    parser.add_argument('--no-eq',      action='store_true',
+                        help='Skip post-blend EQ (bell + high shelf)')
     args = parser.parse_args()
 
     if args.crossover is not None:
@@ -385,6 +453,11 @@ def main() -> int:
 
     result = np.concatenate(chunks_out, axis=0)[:total_samples]
     result = np.clip(result, -1.0, 1.0)
+
+    if not args.no_eq:
+        print(f'[blend] applying post EQ (bell {EQ_BELL_GAIN:+.1f}dB @ {EQ_BELL_FREQ:.0f}Hz, shelf {EQ_SHELF_GAIN:+.1f}dB @ {EQ_SHELF_FREQ:.0f}Hz)...', file=sys.stderr)
+        result = apply_post_eq(result, SAMPLE_RATE)
+        result = np.clip(result, -1.0, 1.0)
 
     print(f"[blend] writing {output_path}...", file=sys.stderr)
     output_path.parent.mkdir(parents=True, exist_ok=True)
